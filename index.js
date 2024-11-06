@@ -6,6 +6,76 @@ app.use(express.json());
 
 const XAI_API_KEY = process.env.XAI_API_KEY;
 
+// 用于发送 SSE 事件的辅助函数
+function sendSSEEvent(res, eventType, data) {
+  try {
+    res.write(`event: ${eventType}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  } catch (error) {
+    console.error(`Error sending SSE event ${eventType}:`, error);
+  }
+}
+
+// 确保总是发送完整的响应序列
+async function sendCompleteResponse(res, messageContent) {
+  try {
+    // 1. 发送 meta 事件
+    sendSSEEvent(res, 'meta', {
+      content_type: 'text/markdown',
+      suggested_replies: true
+    });
+
+    // 2. 调用 X.AI API
+    const xaiResponse = await axios({
+      method: 'post',
+      url: 'https://api.x.ai/v1/chat/completions',
+      headers: {
+        'Authorization': `Bearer ${XAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      data: {
+        model: "grok-beta",
+        messages: [{
+          role: 'user',
+          content: messageContent
+        }],
+        stream: false
+      },
+      timeout: 30000 // 30秒超时
+    });
+
+    const responseText = xaiResponse.data?.choices?.[0]?.message?.content;
+
+    if (!responseText) {
+      throw new Error('No response content from X.AI');
+    }
+
+    // 3. 发送文本响应
+    sendSSEEvent(res, 'text', { text: responseText });
+
+    // 4. 如果回复较长，可以添加一些建议的后续问题
+    if (responseText.length > 100) {
+      sendSSEEvent(res, 'suggested_reply', { text: '能详细解释一下这个观点吗？' });
+      sendSSEEvent(res, 'suggested_reply', { text: '有具体的例子吗？' });
+    }
+
+  } catch (error) {
+    console.error('Error in processing:', error);
+    sendSSEEvent(res, 'error', {
+      text: `Error: ${error.message}`,
+      allow_retry: true
+    });
+  } finally {
+    // 5. 确保总是发送 done 事件
+    try {
+      sendSSEEvent(res, 'done', {});
+      res.end();
+    } catch (finalError) {
+      console.error('Error sending final done event:', finalError);
+    }
+  }
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'ok' });
 });
@@ -30,69 +100,47 @@ app.post('/', async (req, res) => {
     }
 
     if (!messageContent) {
-      // 发送错误事件
-      res.write('event: error\n');
-      res.write(`data: ${JSON.stringify({ text: 'No message content found' })}\n\n`);
-      res.write('event: done\n');
-      res.write('data: {}\n\n');
+      sendSSEEvent(res, 'error', { text: 'No message content found' });
+      sendSSEEvent(res, 'done', {});
       res.end();
       return;
     }
 
-    // 发送元数据事件
-    res.write('event: meta\n');
-    res.write('data: {"content_type": "text/markdown"}\n\n');
-
-    // 调用 X.AI API
-    const xaiResponse = await axios({
-      method: 'post',
-      url: 'https://api.x.ai/v1/chat/completions',
-      headers: {
-        'Authorization': `Bearer ${XAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      data: {
-        model: "grok-beta",
-        messages: [{
-          role: 'user',
-          content: messageContent
-        }],
-        stream: false
-      }
-    });
-
-    console.log('X.AI Response:', JSON.stringify(xaiResponse.data, null, 2));
-
-    const responseText = xaiResponse.data?.choices?.[0]?.message?.content;
-
-    if (!responseText) {
-      // 发送错误事件
-      res.write('event: error\n');
-      res.write(`data: ${JSON.stringify({ text: 'No response from X.AI' })}\n\n`);
-      res.write('event: done\n');
-      res.write('data: {}\n\n');
-      res.end();
-      return;
-    }
-
-    // 发送文本事件
-    res.write('event: text\n');
-    res.write(`data: ${JSON.stringify({ text: responseText })}\n\n`);
-
-    // 发送完成事件
-    res.write('event: done\n');
-    res.write('data: {}\n\n');
-    res.end();
+    // 使用新的响应处理函数
+    await sendCompleteResponse(res, messageContent);
 
   } catch (error) {
-    console.error('Error occurred:', error);
-    
-    // 发送错误事件
-    res.write('event: error\n');
-    res.write(`data: ${JSON.stringify({ text: `Error: ${error.message}` })}\n\n`);
-    res.write('event: done\n');
-    res.write('data: {}\n\n');
+    console.error('Fatal error:', error);
+    try {
+      sendSSEEvent(res, 'error', {
+        text: `Fatal error: ${error.message}`,
+        allow_retry: true
+      });
+      sendSSEEvent(res, 'done', {});
+      res.end();
+    } catch (finalError) {
+      console.error('Error sending error response:', finalError);
+    }
+  }
+});
+
+// 添加错误处理中间件
+app.use((error, req, res, next) => {
+  console.error('Global error handler:', error);
+  try {
+    if (!res.headersSent) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+    }
+    sendSSEEvent(res, 'error', {
+      text: `Server error: ${error.message}`,
+      allow_retry: true
+    });
+    sendSSEEvent(res, 'done', {});
     res.end();
+  } catch (finalError) {
+    console.error('Error in error handler:', finalError);
   }
 });
 
