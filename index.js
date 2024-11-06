@@ -9,12 +9,9 @@ const XAI_API_KEY = process.env.XAI_API_KEY;
 // 调试函数
 function logRequest(req) {
     console.log('Full request body:', JSON.stringify(req.body, null, 2));
-    if (req.body.query && Array.isArray(req.body.query)) {
-        console.log('Last message:', req.body.query[req.body.query.length - 1]);
-    }
 }
 
-// 获取最后一条消息内容
+// 获取最后一条用户消息
 function getLastMessageContent(query) {
     if (!Array.isArray(query) || query.length === 0) {
         console.log('Query is empty or not an array');
@@ -44,7 +41,6 @@ async function streamResponse(res, responseText) {
         
         for (const chunk of chunks) {
             res.write(`event: text\ndata: {"text": ${JSON.stringify(chunk)}}\n\n`);
-            // 使用极小的延迟确保顺序发送
             await new Promise(resolve => setTimeout(resolve, 1));
         }
 
@@ -60,6 +56,17 @@ async function streamResponse(res, responseText) {
 }
 
 app.post('/', async (req, res) => {
+    // 记录请求
+    logRequest(req);
+
+    // 检查请求类型
+    const requestType = req.body.type;
+    if (requestType !== 'query') {
+        // 对于非query请求，直接返回200
+        console.log(`Received ${requestType} request, sending OK response`);
+        return res.status(200).json({ status: 'ok' });
+    }
+
     // 设置响应头
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
@@ -70,9 +77,6 @@ app.post('/', async (req, res) => {
     res.setTimeout(60000);
 
     try {
-        // 记录完整请求
-        logRequest(req);
-
         // 获取最后一条用户消息
         const messageContent = getLastMessageContent(req.body.query);
         
