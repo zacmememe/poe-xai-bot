@@ -12,46 +12,53 @@ app.get('/', (req, res) => {
 
 app.post('/', async (req, res) => {
   try {
-    console.log('Received request body:', req.body);
+    console.log('Received request:', JSON.stringify(req.body));
 
     if (!req.body.query) {
-      throw new Error('No query provided');
+      return res.json({ text: 'No query provided' });
     }
 
-    // X.AI API 请求
-    const response = await axios({
-      method: 'POST',
-      url: 'https://api.x.ai/v1/messages',  // 使用 messages endpoint
+    const xaiResponse = await axios({
+      method: 'post',
+      url: 'https://api.x.ai/v1/chat/completions',
       headers: {
         'Authorization': `Bearer ${XAI_API_KEY}`,
         'Content-Type': 'application/json'
       },
       data: {
-        content: req.body.query
+        model: "x.ai", // 使用 x.ai 的模型
+        messages: [{
+          role: 'user',
+          content: req.body.query
+        }]
       }
     });
 
-    console.log('X.AI response:', response.data);
+    console.log('X.AI Response:', JSON.stringify(xaiResponse.data));
 
-    // 返回给 Poe
-    res.json({
-      text: response.data.content || 'No response content'
+    if (!xaiResponse.data?.choices?.[0]?.message?.content) {
+      return res.json({ text: 'No response content from X.AI' });
+    }
+
+    return res.json({
+      text: xaiResponse.data.choices[0].message.content
     });
 
   } catch (error) {
-    console.error('Error occurred:', {
+    console.error('Error details:', {
       message: error.message,
-      response: error.response?.data,
+      data: error.response?.data,
       status: error.response?.status
     });
 
-    res.status(200).json({
-      text: `Error: ${error.message || 'Unknown error'}`
+    return res.json({
+      text: `Error: ${error.message}. ${error.response?.data?.error || ''}`
     });
   }
 });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log(`Server started on port ${port}`);
+  console.log(`API Key present: ${!!XAI_API_KEY}`);
 });
