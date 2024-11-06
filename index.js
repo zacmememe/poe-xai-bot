@@ -14,12 +14,10 @@ app.post('/', async (req, res) => {
   try {
     console.log('Received request:', JSON.stringify(req.body));
 
-    // 从 Poe 的消息格式中提取实际的文本内容
     const query = req.body.query;
     let messageContent = '';
     
     if (Array.isArray(query)) {
-      // 从消息数组中获取最后一条消息的内容
       const lastMessage = query[query.length - 1];
       messageContent = lastMessage.content || '';
     } else {
@@ -38,10 +36,10 @@ app.post('/', async (req, res) => {
         'Content-Type': 'application/json'
       },
       data: {
-        model: "x.ai-gpt4",
+        model: "default", // 改用 default 作为模型名称
         messages: [{
           role: 'user',
-          content: messageContent // 直接使用文本内容
+          content: messageContent
         }],
         stream: false
       }
