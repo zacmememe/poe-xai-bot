@@ -14,7 +14,19 @@ app.post('/', async (req, res) => {
   try {
     console.log('Received request:', JSON.stringify(req.body));
 
-    if (!req.body.query) {
+    // 从 Poe 的消息格式中提取实际的文本内容
+    const query = req.body.query;
+    let messageContent = '';
+    
+    if (Array.isArray(query)) {
+      // 从消息数组中获取最后一条消息的内容
+      const lastMessage = query[query.length - 1];
+      messageContent = lastMessage.content || '';
+    } else {
+      messageContent = query || '';
+    }
+
+    if (!messageContent) {
       return res.json({ text: 'No query provided' });
     }
 
@@ -29,11 +41,7 @@ app.post('/', async (req, res) => {
         model: "x.ai-gpt4",
         messages: [{
           role: 'user',
-          // 修改消息格式
-          content: {
-            type: 'text',
-            text: req.body.query
-          }
+          content: messageContent // 直接使用文本内容
         }],
         stream: false
       }
@@ -46,7 +54,7 @@ app.post('/', async (req, res) => {
     }
 
     return res.json({
-      text: xaiResponse.data.choices[0].message.content.text
+      text: xaiResponse.data.choices[0].message.content
     });
 
   } catch (error) {
@@ -54,7 +62,7 @@ app.post('/', async (req, res) => {
       message: error.message,
       data: error.response?.data,
       status: error.response?.status,
-      request: error.config?.data // 添加请求数据到日志
+      request: error.config?.data
     });
 
     return res.json({
