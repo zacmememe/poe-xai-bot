@@ -6,56 +6,69 @@ app.use(express.json());
 
 const XAI_API_KEY = process.env.XAI_API_KEY;
 
-// 详细日志
 function log(msg, data = null) {
     const logMsg = data ? `${msg} ${JSON.stringify(data)}` : msg;
     console.log(`[${new Date().toISOString()}] ${logMsg}`);
 }
 
-// SSE发送
 function sendSSE(res, event, data) {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-async function makeAPICall(content) {
-    const config = {
-        method: 'post',
-        url: 'https://api.x.ai/v1/chat/completions',
-        headers: {
-            'Authorization': `Bearer ${XAI_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        data: {
-            model: "grok-beta",
-            messages: [{
-                role: 'user',
-                content: content
-            }],
-            temperature: 0.7,
-            max_tokens: 4000
-        },
-        timeout: 20000
-    };
+async function makeAPICall(content, retries = 3) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            log(`API attempt ${attempt}/${retries}`);
+            
+            const response = await axios({
+                method: 'post',
+                url: 'https://api.x.ai/v1/chat/completions',
+                headers: {
+                    'Authorization': `Bearer ${XAI_API_KEY}`,
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                data: {
+                    model: "grok-beta",
+                    messages: [{
+                        role: 'user',
+                        content: content
+                    }],
+                    temperature: 0.7,
+                    max_tokens: 2000
+                },
+                validateStatus: null, // 允许任何状态码
+                timeout: 10000
+            });
 
-    log('API Request Config:', {
-        url: config.url,
-        method: config.method,
-        headers: {
-            ...config.headers,
-            'Authorization': 'Bearer [HIDDEN]'
-        },
-        data: config.data
-    });
+            log('API Response Status:', response.status);
 
-    const response = await axios(config);
-    
-    log('API Response:', {
-        status: response.status,
-        headers: response.headers,
-        data: response.data
-    });
+            if (response.status !== 200) {
+                throw new Error(`API returned status ${response.status}: ${JSON.stringify(response.data)}`);
+            }
 
-    return response.data?.choices?.[0]?.message?.content;
+            const responseText = response.data?.choices?.[0]?.message?.content;
+            if (!responseText) {
+                throw new Error('API response missing content');
+            }
+
+            return responseText;
+
+        } catch (error) {
+            log('API Error:', {
+                attempt,
+                error: error.message,
+                response: error.response?.data
+            });
+
+            if (attempt === retries) {
+                throw error;
+            }
+
+            // 等待后重试
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        }
+    }
 }
 
 app.post('/', async (req, res) => {
@@ -63,14 +76,13 @@ app.post('/', async (req, res) => {
         return res.json({ status: 'ok' });
     }
 
-    log('Received Query Request:', {
-        type: req.body.type,
-        queryLength: req.body.query?.length
-    });
+    log('Query received:', { type: req.body.type });
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+
+    let responseStarted = false;
 
     try {
         const message = req.body.query?.[req.body.query.length - 1]?.content;
@@ -78,34 +90,21 @@ app.post('/', async (req, res) => {
             throw new Error('No message content');
         }
 
-        log('Processing message:', { content: message });
-
-        // 发送初始事件
+        // 初始响应
         sendSSE(res, 'meta', { content_type: 'text/markdown' });
         sendSSE(res, 'replace_response', { text: '正在处理请求...\n\n' });
+        responseStarted = true;
 
-        // API调用
-        log('Making API call');
+        // 调用API
         const responseText = await makeAPICall(message);
-        log('API response length:', { length: responseText?.length });
-
-        if (!responseText) {
-            throw new Error('Empty response from API');
-        }
+        log('API call successful, response length:', responseText.length);
 
         // 清除等待消息
         sendSSE(res, 'replace_response', { text: '' });
 
-        // 分块发送响应
-        const chunkSize = 1000;
-        let position = 0;
-
-        while (position < responseText.length) {
-            const chunk = responseText.slice(position, position + chunkSize);
-            sendSSE(res, 'text', { text: chunk });
-            position += chunkSize;
-            log('Sent chunk:', { position, total: responseText.length });
-        }
+        // 发送测试消息
+        const testResponse = '测试响应：我收到了你的请求，正在处理中。API调用已完成，这是一个测试消息。';
+        sendSSE(res, 'text', { text: testResponse });
 
         sendSSE(res, 'done', {});
         res.end();
@@ -114,35 +113,33 @@ app.post('/', async (req, res) => {
     } catch (error) {
         log('Error occurred:', {
             message: error.message,
-            stack: error.stack,
-            response: error.response?.data
+            responseStarted
         });
 
-        sendSSE(res, 'error', {
-            text: `Error: ${error.message}`,
-            allow_retry: true
-        });
-        sendSSE(res, 'done', {});
-        res.end();
+        if (!res.writableEnded) {
+            if (!responseStarted) {
+                sendSSE(res, 'meta', { content_type: 'text/markdown' });
+            }
+            sendSSE(res, 'error', {
+                text: `处理请求时出错: ${error.message}`,
+                allow_retry: true
+            });
+            sendSSE(res, 'done', {});
+            res.end();
+        }
     }
 });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-    log('Server started', { port });
+    log('Server started on port:', port);
 });
 
 // 错误处理
 process.on('uncaughtException', error => {
-    log('Uncaught Exception:', {
-        message: error.message,
-        stack: error.stack
-    });
+    log('Uncaught Exception:', error.message);
 });
 
 process.on('unhandledRejection', error => {
-    log('Unhandled Rejection:', {
-        message: error.message,
-        stack: error.stack
-    });
+    log('Unhandled Rejection:', error.message);
 });
