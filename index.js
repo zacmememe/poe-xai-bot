@@ -6,88 +6,39 @@ app.use(express.json());
 
 const XAI_API_KEY = process.env.XAI_API_KEY;
 
-// 调试函数
-function logRequest(req) {
-    console.log('Full request body:', JSON.stringify(req.body, null, 2));
+// 日志函数
+function log(message, data = null) {
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] ${message}`);
+    if (data) {
+        console.log(JSON.stringify(data, null, 2));
+    }
 }
 
-// 获取最后一条用户消息
-function getLastMessageContent(query) {
-    if (!Array.isArray(query) || query.length === 0) {
-        console.log('Query is empty or not an array');
-        return null;
-    }
-
-    // 获取最后一条用户消息
-    for (let i = query.length - 1; i >= 0; i--) {
-        const message = query[i];
-        if (message.role === 'user' && message.content) {
-            return message.content;
-        }
-    }
-
-    console.log('No valid user message found');
-    return null;
+// 简单的 SSE 发送函数
+function sendSSE(res, event, data) {
+    const eventString = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    log(`Sending ${event} event`);
+    return res.write(eventString);
 }
 
-// 流式响应处理
-async function streamResponse(res, responseText) {
+async function handleQuery(req, res) {
     try {
-        // 1. 发送 meta 事件
-        res.write('event: meta\ndata: {"content_type": "text/markdown"}\n\n');
+        const lastMessage = req.body.query?.[req.body.query.length - 1];
         
-        // 2. 开始发送文本，每25个字符一个块
-        const chunks = responseText.match(/.{1,25}/g) || [];
-        
-        for (const chunk of chunks) {
-            res.write(`event: text\ndata: {"text": ${JSON.stringify(chunk)}}\n\n`);
-            await new Promise(resolve => setTimeout(resolve, 1));
+        if (!lastMessage?.content) {
+            throw new Error('Invalid message content');
         }
 
-        // 3. 发送完成事件
-        res.write('event: done\ndata: {}\n\n');
-        res.end();
+        // 发送初始元数据
+        sendSSE(res, 'meta', { content_type: 'text/markdown' });
         
-        return true;
-    } catch (error) {
-        console.error('Error in streamResponse:', error);
-        return false;
-    }
-}
+        // 发送等待消息
+        sendSSE(res, 'text', { text: '正在生成回应...\n\n' });
 
-app.post('/', async (req, res) => {
-    // 记录请求
-    logRequest(req);
-
-    // 检查请求类型
-    const requestType = req.body.type;
-    if (requestType !== 'query') {
-        // 对于非query请求，直接返回200
-        console.log(`Received ${requestType} request, sending OK response`);
-        return res.status(200).json({ status: 'ok' });
-    }
-
-    // 设置响应头
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    
-    // 设置更长的超时时间
-    req.setTimeout(60000);
-    res.setTimeout(60000);
-
-    try {
-        // 获取最后一条用户消息
-        const messageContent = getLastMessageContent(req.body.query);
-        
-        if (!messageContent) {
-            throw new Error('No valid user message found');
-        }
-
-        console.log('Processing message:', messageContent);
-
-        // 配置API调用
-        const apiConfig = {
+        // 调用 API
+        log('Calling X.AI API');
+        const response = await axios({
             method: 'post',
             url: 'https://api.x.ai/v1/chat/completions',
             headers: {
@@ -98,77 +49,92 @@ app.post('/', async (req, res) => {
                 model: "grok-beta",
                 messages: [{
                     role: 'user',
-                    content: messageContent
+                    content: lastMessage.content
                 }],
-                stream: false,
                 max_tokens: 8000,
                 temperature: 0.7
             },
-            timeout: 45000
-        };
+            timeout: 30000
+        });
 
-        // 开始立即发送初始响应
-        res.write('event: text\ndata: {"text": "正在生成响应..."}\n\n');
-
-        // 执行API调用
-        let response;
-        try {
-            console.log('Calling X.AI API...');
-            response = await axios(apiConfig);
-            console.log('API response received');
-        } catch (error) {
-            console.error('First API call failed, retrying...');
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            response = await axios(apiConfig);
-        }
-
-        const responseText = response?.data?.choices?.[0]?.message?.content;
+        const responseText = response.data?.choices?.[0]?.message?.content;
         if (!responseText) {
-            throw new Error('No response content from API');
+            throw new Error('Empty API response');
         }
 
-        console.log('Response length:', responseText.length);
+        log(`Received response of length: ${responseText.length}`);
 
-        // 清除初始消息
-        res.write('event: replace_response\ndata: {"text": ""}\n\n');
+        // 清除等待消息
+        sendSSE(res, 'replace_response', { text: '' });
 
-        // 流式发送实际响应
-        const success = await streamResponse(res, responseText);
-        if (!success) {
-            throw new Error('Failed to stream response');
+        // 分块发送响应
+        const chunkSize = 100;
+        for (let i = 0; i < responseText.length; i += chunkSize) {
+            const chunk = responseText.slice(i, i + chunkSize);
+            sendSSE(res, 'text', { text: chunk });
+            // 最小延迟以确保顺序
+            await new Promise(resolve => setTimeout(resolve, 5));
         }
+
+        // 发送完成事件
+        sendSSE(res, 'done', {});
+        res.end();
 
     } catch (error) {
-        console.error('Error occurred:', error);
-        
-        try {
-            if (!res.writableEnded) {
-                res.write('event: error\n');
-                res.write(`data: {"text": "Error: ${error.message}", "allow_retry": true}\n\n`);
-                res.write('event: done\ndata: {}\n\n');
-                res.end();
-            }
-        } catch (finalError) {
-            console.error('Error sending error response:', finalError);
-        }
+        log('Error in handleQuery:', error.message);
+        sendSSE(res, 'error', { 
+            text: `Error: ${error.message}`,
+            allow_retry: true
+        });
+        sendSSE(res, 'done', {});
+        res.end();
+    }
+}
+
+app.post('/', async (req, res) => {
+    // 记录请求
+    log('Received request', { type: req.body.type });
+
+    // 设置响应头
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    // 根据请求类型处理
+    switch (req.body.type) {
+        case 'query':
+            await handleQuery(req, res);
+            break;
+        case 'report_error':
+            log('Received error report', req.body);
+            res.json({ status: 'ok' });
+            break;
+        case 'report_feedback':
+            log('Received feedback', req.body);
+            res.json({ status: 'ok' });
+            break;
+        default:
+            log('Received unknown request type', req.body);
+            res.json({ status: 'ok' });
     }
 });
 
+// 健康检查端点
 app.get('/', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 const port = process.env.PORT || 3000;
 const server = app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
-    console.log(`API Key configured: ${!!XAI_API_KEY}`);
+    log(`Server running on port ${port}`);
+    log(`API Key configured: ${!!XAI_API_KEY}`);
 });
 
 // 错误处理
 process.on('uncaughtException', (error) => {
-    console.error('Uncaught exception:', error);
+    log('Uncaught exception:', error);
 });
 
 process.on('unhandledRejection', (error) => {
-    console.error('Unhandled rejection:', error);
+    log('Unhandled rejection:', error);
 });
