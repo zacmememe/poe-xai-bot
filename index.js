@@ -15,29 +15,22 @@ function log(message, data = null) {
     }
 }
 
-// 简单的 SSE 发送函数
+// SSE 发送函数
 function sendSSE(res, event, data) {
-    const eventString = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-    log(`Sending ${event} event`);
-    return res.write(eventString);
+    try {
+        const eventString = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+        log(`Sending ${event} event`);
+        return res.write(eventString);
+    } catch (error) {
+        log(`Error sending SSE event: ${error.message}`);
+        return false;
+    }
 }
 
-async function handleQuery(req, res) {
+// API 调用函数
+async function callXAIAPI(content, attempt = 1) {
+    log(`API call attempt ${attempt}`);
     try {
-        const lastMessage = req.body.query?.[req.body.query.length - 1];
-        
-        if (!lastMessage?.content) {
-            throw new Error('Invalid message content');
-        }
-
-        // 发送初始元数据
-        sendSSE(res, 'meta', { content_type: 'text/markdown' });
-        
-        // 发送等待消息
-        sendSSE(res, 'text', { text: '正在生成回应...\n\n' });
-
-        // 调用 API
-        log('Calling X.AI API');
         const response = await axios({
             method: 'post',
             url: 'https://api.x.ai/v1/chat/completions',
@@ -49,7 +42,7 @@ async function handleQuery(req, res) {
                 model: "grok-beta",
                 messages: [{
                     role: 'user',
-                    content: lastMessage.content
+                    content: content
                 }],
                 max_tokens: 8000,
                 temperature: 0.7
@@ -57,42 +50,80 @@ async function handleQuery(req, res) {
             timeout: 30000
         });
 
-        const responseText = response.data?.choices?.[0]?.message?.content;
-        if (!responseText) {
+        if (!response.data?.choices?.[0]?.message?.content) {
             throw new Error('Empty API response');
         }
 
+        return response.data.choices[0].message.content;
+    } catch (error) {
+        log(`API call error (attempt ${attempt}):`, error.message);
+        if (attempt < 3) {
+            log('Retrying...');
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+            return callXAIAPI(content, attempt + 1);
+        }
+        throw error;
+    }
+}
+
+async function handleQuery(req, res) {
+    let hasStarted = false;
+    let hasEnded = false;
+
+    const cleanup = (error = null) => {
+        if (hasEnded) return;
+        hasEnded = true;
+
+        try {
+            if (error) {
+                log('Sending error response:', error.message);
+                sendSSE(res, 'error', {
+                    text: `Error: ${error.message}`,
+                    allow_retry: true
+                });
+            }
+            sendSSE(res, 'done', {});
+            res.end();
+        } catch (finalError) {
+            log('Error during cleanup:', finalError.message);
+        }
+    };
+
+    try {
+        const lastMessage = req.body.query?.[req.body.query.length - 1];
+        
+        if (!lastMessage?.content) {
+            throw new Error('Invalid message content');
+        }
+
+        // 开始响应流
+        hasStarted = true;
+        sendSSE(res, 'meta', { content_type: 'text/markdown' });
+        sendSSE(res, 'text', { text: '正在生成回应...\n\n' });
+
+        // 调用 API
+        const responseText = await callXAIAPI(lastMessage.content);
         log(`Received response of length: ${responseText.length}`);
 
         // 清除等待消息
         sendSSE(res, 'replace_response', { text: '' });
 
         // 分块发送响应
-        const chunkSize = 100;
-        for (let i = 0; i < responseText.length; i += chunkSize) {
-            const chunk = responseText.slice(i, i + chunkSize);
+        const chunks = responseText.match(/.{1,100}/g) || [];
+        for (const chunk of chunks) {
             sendSSE(res, 'text', { text: chunk });
-            // 最小延迟以确保顺序
-            await new Promise(resolve => setTimeout(resolve, 5));
+            await new Promise(resolve => setTimeout(resolve, 10));
         }
 
-        // 发送完成事件
-        sendSSE(res, 'done', {});
-        res.end();
+        cleanup();
 
     } catch (error) {
         log('Error in handleQuery:', error.message);
-        sendSSE(res, 'error', { 
-            text: `Error: ${error.message}`,
-            allow_retry: true
-        });
-        sendSSE(res, 'done', {});
-        res.end();
+        cleanup(error);
     }
 }
 
 app.post('/', async (req, res) => {
-    // 记录请求
     log('Received request', { type: req.body.type });
 
     // 设置响应头
@@ -100,17 +131,18 @@ app.post('/', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
+    // 设置超时
+    req.setTimeout(60000);
+    res.setTimeout(60000);
+
     // 根据请求类型处理
     switch (req.body.type) {
         case 'query':
             await handleQuery(req, res);
             break;
         case 'report_error':
-            log('Received error report', req.body);
-            res.json({ status: 'ok' });
-            break;
         case 'report_feedback':
-            log('Received feedback', req.body);
+            log(`Received ${req.body.type}`, req.body);
             res.json({ status: 'ok' });
             break;
         default:
@@ -119,7 +151,6 @@ app.post('/', async (req, res) => {
     }
 });
 
-// 健康检查端点
 app.get('/', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
