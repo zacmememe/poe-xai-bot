@@ -1,6 +1,4 @@
 from fastapi import FastAPI, Request
-from typing import Dict
-import os
 
 app = FastAPI()
 
@@ -9,9 +7,9 @@ async def root():
     return {"status": "ok"}
 
 @app.post("/")
-async def handle_message(request: Request) -> Dict:
+async def handle_message(request: Request):
     try:
         data = await request.json()
-        return {"response": "test message"}  # 先测试基本功能
+        return {"response": "Hello! This is a test response."}
     except Exception as e:
         return {"response": f"Error: {str(e)}"}
