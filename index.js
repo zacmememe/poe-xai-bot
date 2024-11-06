@@ -10,154 +10,186 @@ const POE_MAX_LENGTH = 95000;
 // 日志函数
 function log(message, data = null) {
     const timestamp = new Date().toISOString();
-    console.log(`[${timestamp}] ${message}`);
-    if (data) {
-        console.log(JSON.stringify(data, null, 2));
-    }
+    const logMessage = data ? 
+        `[${timestamp}] ${message} ${JSON.stringify(data, null, 2)}` :
+        `[${timestamp}] ${message}`;
+    console.log(logMessage);
 }
 
 // SSE 发送函数
 function sendSSE(res, event, data) {
     try {
         const eventString = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-        return res.write(eventString);
+        const success = res.write(eventString);
+        log(`SSE sent: ${event}`, { success });
+        return success;
     } catch (error) {
-        log(`Error sending SSE: ${error.message}`);
+        log(`SSE error: ${event}`, { error: error.message });
         return false;
     }
 }
 
-// 指数退避重试
-async function exponentialBackoff(attempt) {
-    const delay = Math.min(1000 * Math.pow(2, attempt), 8000); // 最大8秒
-    await new Promise(resolve => setTimeout(resolve, delay));
-}
+// API调用函数
+async function callXAIAPI(content) {
+    log('Starting API call', { contentLength: content.length });
+    
+    const config = {
+        method: 'post',
+        url: 'https://api.x.ai/v1/chat/completions',
+        headers: {
+            'Authorization': `Bearer ${XAI_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        data: {
+            model: "grok-beta",
+            messages: [{
+                role: 'user',
+                content: content
+            }],
+            max_tokens: 8000,
+            temperature: 0.7
+        },
+        timeout: 30000,
+        validateStatus: status => status < 500 // 只接受5xx以下的状态码
+    };
 
-// API 调用函数
-async function callXAIAPI(content, updateStatus) {
-    let lastError = null;
-    const maxAttempts = 5; // 增加重试次数
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    for (let attempt = 1; attempt <= 5; attempt++) {
         try {
-            updateStatus(`尝试调用 API (${attempt}/${maxAttempts})...`);
-            log(`API attempt ${attempt}/${maxAttempts}`);
-
-            const response = await axios({
-                method: 'post',
-                url: 'https://api.x.ai/v1/chat/completions',
-                headers: {
-                    'Authorization': `Bearer ${XAI_API_KEY}`,
-                    'Content-Type': 'application/json'
-                },
-                data: {
-                    model: "grok-beta",
-                    messages: [{
-                        role: 'user',
-                        content: content
-                    }],
-                    max_tokens: 8000,
-                    temperature: 0.7
-                },
-                timeout: 20000
+            log(`API attempt ${attempt}/5`);
+            
+            const startTime = Date.now();
+            const response = await axios(config);
+            const endTime = Date.now();
+            
+            log('API response received', { 
+                duration: endTime - startTime,
+                status: response.status,
+                hasData: !!response.data
             });
 
-            const responseText = response.data?.choices?.[0]?.message?.content;
-            if (!responseText) {
-                throw new Error('Empty response from API');
+            if (!response.data?.choices?.[0]?.message?.content) {
+                throw new Error('Invalid response structure');
             }
 
-            return responseText;
+            return response.data.choices[0].message.content;
 
         } catch (error) {
-            lastError = error;
-            log(`API error on attempt ${attempt}:`, {
-                status: error.response?.status,
+            const errorInfo = {
+                attempt,
                 message: error.message,
+                status: error.response?.status,
                 data: error.response?.data
-            });
+            };
+            log('API error', errorInfo);
 
-            // 对于503错误使用更长的重试时间
-            if (error.response?.status === 503) {
-                updateStatus(`服务暂时不可用，正在重试 (${attempt}/${maxAttempts})...`);
-                await exponentialBackoff(attempt);
-            } else if (attempt < maxAttempts) {
-                updateStatus(`API调用失败，正在重试 (${attempt}/${maxAttempts})...`);
-                await exponentialBackoff(attempt - 1);
-            } else {
-                throw new Error(`API调用失败: ${error.message}`);
+            if (attempt === 5) {
+                throw new Error(`API失败: ${error.message}`);
             }
+
+            // 计算退避时间
+            const delay = Math.min(1000 * Math.pow(2, attempt), 8000);
+            await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
-
-    throw lastError || new Error('所有重试都失败了');
 }
 
 async function handleQuery(req, res) {
+    let hasStarted = false;
+    let hasEnded = false;
+
     try {
         const message = req.body.query?.[req.body.query.length - 1]?.content;
         if (!message) {
-            throw new Error('No message content found');
+            throw new Error('No message content');
         }
 
-        // 发送初始事件
+        // 开始响应流
+        hasStarted = true;
+        log('Starting response stream');
         sendSSE(res, 'meta', { content_type: 'text/markdown' });
-        
-        // 状态更新函数
-        const updateStatus = (status) => {
-            sendSSE(res, 'replace_response', { text: `${status}\n\n` });
+
+        // 调用API
+        let updateCount = 0;
+        const updateStatus = (text) => {
+            updateCount++;
+            sendSSE(res, 'replace_response', { 
+                text: `${text} [${updateCount}]\n\n` 
+            });
         };
 
-        updateStatus('正在初始化请求...');
+        updateStatus('正在调用API...');
+        const responseText = await callXAIAPI(message);
+        
+        log('Processing response', { length: responseText.length });
 
-        // 调用 API
-        const responseText = await callXAIAPI(message, updateStatus);
-        log(`Received response of length: ${responseText.length}`);
-
-        // 处理响应长度
+        // 截断过长的响应
         let finalText = responseText;
         if (responseText.length > POE_MAX_LENGTH) {
             const lastPeriod = responseText.lastIndexOf('。', POE_MAX_LENGTH);
-            finalText = responseText.substring(0, lastPeriod > 0 ? lastPeriod + 1 : POE_MAX_LENGTH);
+            finalText = responseText.substring(0, 
+                lastPeriod > POE_MAX_LENGTH * 0.8 ? lastPeriod + 1 : POE_MAX_LENGTH);
+            log('Response truncated', { 
+                originalLength: responseText.length,
+                newLength: finalText.length 
+            });
         }
 
         // 清除状态消息
         sendSSE(res, 'replace_response', { text: '' });
 
         // 分块发送
+        log('Starting chunked response');
         const chunkSize = 1000;
-        for (let i = 0; i < finalText.length; i += chunkSize) {
-            const chunk = finalText.slice(i, i + chunkSize);
+        let position = 0;
+        let chunkCount = 0;
+
+        while (position < finalText.length) {
+            const chunk = finalText.slice(position, position + chunkSize);
             sendSSE(res, 'text', { text: chunk });
-            await new Promise(resolve => setTimeout(resolve, 5));
+            
+            position += chunkSize;
+            chunkCount++;
+            
+            log(`Sent chunk ${chunkCount}`, { 
+                position,
+                total: finalText.length 
+            });
+
+            await new Promise(resolve => setTimeout(resolve, 10));
         }
 
-        // 完成
+        // 完成响应
+        log('Completing response');
         sendSSE(res, 'done', {});
+        hasEnded = true;
         res.end();
 
     } catch (error) {
-        log('Error in handleQuery:', error);
-        try {
-            if (!res.writableEnded) {
+        log('Error occurred', { error: error.message, hasStarted, hasEnded });
+        
+        if (!hasEnded && !res.writableEnded) {
+            try {
                 sendSSE(res, 'error', {
-                    text: `生成响应时出错: ${error.message}`,
+                    text: `错误: ${error.message}`,
                     allow_retry: true
                 });
                 sendSSE(res, 'done', {});
                 res.end();
+            } catch (finalError) {
+                log('Error sending error response', { error: finalError.message });
             }
-        } catch (finalError) {
-            log('Error sending error response:', finalError);
         }
     }
 }
 
 app.post('/', async (req, res) => {
+    log('Received request', { type: req.body.type });
+
     if (req.body.type !== 'query') {
         return res.json({ status: 'ok' });
     }
 
+    // 设置响应头
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -165,21 +197,16 @@ app.post('/', async (req, res) => {
     await handleQuery(req, res);
 });
 
-app.get('/', (req, res) => {
-    res.json({ status: 'ok' });
-});
-
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-    log(`Server running on port ${port}`);
-    log(`API Key configured: ${!!XAI_API_KEY}`);
+    log('Server started', { port, hasAPIKey: !!XAI_API_KEY });
 });
 
 // 错误处理
 process.on('uncaughtException', error => {
-    log('Uncaught Exception:', error);
+    log('Uncaught Exception', { error: error.message });
 });
 
 process.on('unhandledRejection', error => {
-    log('Unhandled Rejection:', error);
+    log('Unhandled Rejection', { error: error.message });
 });
