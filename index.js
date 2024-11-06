@@ -12,70 +12,46 @@ app.get('/', (req, res) => {
 
 app.post('/', async (req, res) => {
   try {
-    // 详细记录接收到的请求
-    console.log('Received raw request:', JSON.stringify(req.body, null, 2));
-    console.log('Headers:', JSON.stringify(req.headers, null, 2));
+    console.log('Received request body:', req.body);
 
-    // 检查 API key
-    if (!XAI_API_KEY) {
-      throw new Error('API key not configured');
-    }
-
-    // 从请求中获取消息
-    const query = req.body.query;
-    if (!query) {
-      console.log('No query found in request body');
+    if (!req.body.query) {
       throw new Error('No query provided');
     }
 
-    // 构建 x.ai API 请求
-    const requestData = {
-      messages: [
-        {
-          role: "user",
-          content: query
-        }
-      ]
-    };
-
-    console.log('Sending request to X.AI:', JSON.stringify(requestData, null, 2));
-
-    // 发送请求到 x.ai
-    const xaiResponse = await axios({
-      method: 'post',
-      url: 'https://api.x.ai/v1/chat/completions',
+    // X.AI API 请求
+    const response = await axios({
+      method: 'POST',
+      url: 'https://api.x.ai/v1/messages',  // 使用 messages endpoint
       headers: {
         'Authorization': `Bearer ${XAI_API_KEY}`,
         'Content-Type': 'application/json'
       },
-      data: requestData,
-      timeout: 30000 // 30 秒超时
+      data: {
+        content: req.body.query
+      }
     });
 
-    console.log('X.AI response:', JSON.stringify(xaiResponse.data, null, 2));
+    console.log('X.AI response:', response.data);
 
-    // 返回响应给 Poe
+    // 返回给 Poe
     res.json({
-      text: xaiResponse.data.choices[0].message.content
+      text: response.data.content || 'No response content'
     });
 
   } catch (error) {
-    console.error('Full error:', {
+    console.error('Error occurred:', {
       message: error.message,
-      data: error.response?.data,
-      status: error.response?.status,
-      headers: error.response?.headers,
-      requestData: error.config?.data
+      response: error.response?.data,
+      status: error.response?.status
     });
 
-    // 返回错误信息
-    res.status(500).json({
-      text: `Error: ${error.message}. ${error.response?.data?.error || ''}`
+    res.status(200).json({
+      text: `Error: ${error.message || 'Unknown error'}`
     });
   }
 });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log(`Server running on port ${port}, API Key present: ${!!XAI_API_KEY}`);
+  console.log(`Server running on port ${port}`);
 });
