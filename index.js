@@ -6,6 +6,33 @@ app.use(express.json());
 
 const XAI_API_KEY = process.env.XAI_API_KEY;
 
+// 调试函数
+function logRequest(req) {
+    console.log('Full request body:', JSON.stringify(req.body, null, 2));
+    if (req.body.query && Array.isArray(req.body.query)) {
+        console.log('Last message:', req.body.query[req.body.query.length - 1]);
+    }
+}
+
+// 获取最后一条消息内容
+function getLastMessageContent(query) {
+    if (!Array.isArray(query) || query.length === 0) {
+        console.log('Query is empty or not an array');
+        return null;
+    }
+
+    // 获取最后一条用户消息
+    for (let i = query.length - 1; i >= 0; i--) {
+        const message = query[i];
+        if (message.role === 'user' && message.content) {
+            return message.content;
+        }
+    }
+
+    console.log('No valid user message found');
+    return null;
+}
+
 // 流式响应处理
 async function streamResponse(res, responseText) {
     try {
@@ -43,14 +70,17 @@ app.post('/', async (req, res) => {
     res.setTimeout(60000);
 
     try {
-        const query = req.body.query;
-        const lastMessage = Array.isArray(query) && query.length > 0 
-            ? query[query.length - 1] 
-            : null;
+        // 记录完整请求
+        logRequest(req);
 
-        if (!lastMessage?.content) {
-            throw new Error('No message content found');
+        // 获取最后一条用户消息
+        const messageContent = getLastMessageContent(req.body.query);
+        
+        if (!messageContent) {
+            throw new Error('No valid user message found');
         }
+
+        console.log('Processing message:', messageContent);
 
         // 配置API调用
         const apiConfig = {
@@ -64,13 +94,13 @@ app.post('/', async (req, res) => {
                 model: "grok-beta",
                 messages: [{
                     role: 'user',
-                    content: lastMessage.content
+                    content: messageContent
                 }],
                 stream: false,
-                max_tokens: 8000,  // 显著增加token限制
+                max_tokens: 8000,
                 temperature: 0.7
             },
-            timeout: 45000  // 45秒超时
+            timeout: 45000
         };
 
         // 开始立即发送初始响应
@@ -79,10 +109,11 @@ app.post('/', async (req, res) => {
         // 执行API调用
         let response;
         try {
+            console.log('Calling X.AI API...');
             response = await axios(apiConfig);
+            console.log('API response received');
         } catch (error) {
             console.error('First API call failed, retrying...');
-            // 等待1秒后重试
             await new Promise(resolve => setTimeout(resolve, 1000));
             response = await axios(apiConfig);
         }
@@ -91,6 +122,8 @@ app.post('/', async (req, res) => {
         if (!responseText) {
             throw new Error('No response content from API');
         }
+
+        console.log('Response length:', responseText.length);
 
         // 清除初始消息
         res.write('event: replace_response\ndata: {"text": ""}\n\n');
