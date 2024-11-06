@@ -33,26 +33,33 @@ app.post('/', async (req, res) => {
       url: 'https://api.x.ai/v1/chat/completions',
       headers: {
         'Authorization': `Bearer ${XAI_API_KEY}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
       },
       data: {
-        model: "grok-beta", // 使用 grok-beta 模型
+        model: "grok-beta",
         messages: [{
           role: 'user',
           content: messageContent
         }],
         stream: false
-      }
+      },
+      responseType: 'json'
     });
 
     console.log('X.AI Response:', JSON.stringify(xaiResponse.data));
 
-    if (!xaiResponse.data?.choices?.[0]?.message?.content) {
+    // 确保我们能获取到响应内容
+    const responseContent = xaiResponse.data?.choices?.[0]?.message?.content;
+    
+    if (!responseContent) {
+      console.error('No response content found in:', xaiResponse.data);
       return res.json({ text: 'No response content from X.AI' });
     }
 
+    // 直接返回响应内容，确保是字符串格式
     return res.json({
-      text: xaiResponse.data.choices[0].message.content
+      text: String(responseContent)
     });
 
   } catch (error) {
@@ -63,8 +70,9 @@ app.post('/', async (req, res) => {
       request: error.config?.data
     });
 
+    // 确保错误消息也是字符串格式
     return res.json({
-      text: `Error: ${error.message}. ${error.response?.data?.error || ''}`
+      text: String(`Error: ${error.message}. ${error.response?.data?.error || ''}`)
     });
   }
 });
