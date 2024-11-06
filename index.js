@@ -106,3 +106,30 @@ app.post('/', async (req, res) => {
 
     if (!responseText) {
       await sendErrorMessage(res, new Error('No response from X.AI'));
+      return;
+    }
+
+    // 发送完整响应
+    const success = await sendSSEMessage(res, responseText);
+    
+    if (!success) {
+      throw new Error('Failed to send complete response');
+    }
+
+  } catch (error) {
+    console.error('Error occurred:', error);
+    await sendErrorMessage(res, error);
+  }
+});
+
+// 添加错误处理中间件
+app.use((error, req, res, next) => {
+  console.error('Global error handler:', error);
+  sendErrorMessage(res, error).catch(console.error);
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+  console.log(`API Key configured: ${!!XAI_API_KEY}`);
+});
