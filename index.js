@@ -11,27 +11,39 @@ app.get('/', (req, res) => {
 });
 
 app.post('/', async (req, res) => {
-  try {
-    // 详细记录收到的请求
-    console.log('Received Poe request:', JSON.stringify(req.body, null, 2));
+  // 设置 SSE 头
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
 
-    // 从 Poe 请求中提取消息
+  try {
+    console.log('Received request:', JSON.stringify(req.body, null, 2));
+
+    const query = req.body.query;
     let messageContent = '';
-    if (req.body.query && Array.isArray(req.body.query)) {
-      const lastMessage = req.body.query[req.body.query.length - 1];
+    
+    if (Array.isArray(query)) {
+      const lastMessage = query[query.length - 1];
       if (lastMessage && lastMessage.content) {
         messageContent = lastMessage.content;
       }
     }
 
     if (!messageContent) {
-      console.log('No message content found in request');
-      return res.status(200).json({ text: '' });
+      // 发送错误事件
+      res.write('event: error\n');
+      res.write(`data: ${JSON.stringify({ text: 'No message content found' })}\n\n`);
+      res.write('event: done\n');
+      res.write('data: {}\n\n');
+      res.end();
+      return;
     }
 
-    console.log('Extracted message:', messageContent);
+    // 发送元数据事件
+    res.write('event: meta\n');
+    res.write('data: {"content_type": "text/markdown"}\n\n');
 
-    // 发送到 X.AI
+    // 调用 X.AI API
     const xaiResponse = await axios({
       method: 'post',
       url: 'https://api.x.ai/v1/chat/completions',
@@ -49,34 +61,38 @@ app.post('/', async (req, res) => {
       }
     });
 
-    console.log('X.AI raw response:', JSON.stringify(xaiResponse.data, null, 2));
+    console.log('X.AI Response:', JSON.stringify(xaiResponse.data, null, 2));
 
-    // 从 X.AI 响应中提取回复内容
     const responseText = xaiResponse.data?.choices?.[0]?.message?.content;
 
     if (!responseText) {
-      console.log('No response text found in X.AI response');
-      return res.status(200).json({ text: '' });
+      // 发送错误事件
+      res.write('event: error\n');
+      res.write(`data: ${JSON.stringify({ text: 'No response from X.AI' })}\n\n`);
+      res.write('event: done\n');
+      res.write('data: {}\n\n');
+      res.end();
+      return;
     }
 
-    console.log('Sending response to Poe:', { text: responseText });
+    // 发送文本事件
+    res.write('event: text\n');
+    res.write(`data: ${JSON.stringify({ text: responseText })}\n\n`);
 
-    // 返回给 Poe
-    return res.status(200).json({
-      text: responseText
-    });
+    // 发送完成事件
+    res.write('event: done\n');
+    res.write('data: {}\n\n');
+    res.end();
 
   } catch (error) {
-    console.error('Error occurred:', {
-      message: error.message,
-      response: error.response?.data,
-      status: error.response?.status
-    });
-
-    // 即使发生错误也返回 200 状态码
-    return res.status(200).json({
-      text: `Error: ${error.message}`
-    });
+    console.error('Error occurred:', error);
+    
+    // 发送错误事件
+    res.write('event: error\n');
+    res.write(`data: ${JSON.stringify({ text: `Error: ${error.message}` })}\n\n`);
+    res.write('event: done\n');
+    res.write('data: {}\n\n');
+    res.end();
   }
 });
 
