@@ -6,62 +6,29 @@ app.use(express.json());
 
 const XAI_API_KEY = process.env.XAI_API_KEY;
 
-// SSE 事件发送函数
-function sendSSE(res, event, data) {
+// 流式响应处理
+async function streamResponse(res, responseText) {
     try {
-        if (!res.writableEnded) {
-            const eventString = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-            res.write(eventString);
-            return true;
-        }
-        return false;
-    } catch (error) {
-        console.error(`Failed to send SSE event ${event}:`, error);
-        return false;
-    }
-}
-
-// 分块发送长文本
-async function sendLongResponse(res, text) {
-    try {
-        // 发送 meta 事件
-        sendSSE(res, 'meta', { content_type: 'text/markdown' });
-
-        // 按照较小的块发送文本
-        const chunkSize = 1000; // 每次发送1000字符
-        let position = 0;
-
-        while (position < text.length) {
-            const chunk = text.slice(position, position + chunkSize);
-            sendSSE(res, 'text', { text: chunk });
-            position += chunkSize;
-            // 小延迟以确保顺序发送
-            await new Promise(resolve => setTimeout(resolve, 5));
+        // 1. 发送 meta 事件
+        res.write('event: meta\ndata: {"content_type": "text/markdown"}\n\n');
+        
+        // 2. 开始发送文本，每25个字符一个块
+        const chunks = responseText.match(/.{1,25}/g) || [];
+        
+        for (const chunk of chunks) {
+            res.write(`event: text\ndata: {"text": ${JSON.stringify(chunk)}}\n\n`);
+            // 使用极小的延迟确保顺序发送
+            await new Promise(resolve => setTimeout(resolve, 1));
         }
 
-        // 发送完成事件
-        sendSSE(res, 'done', {});
+        // 3. 发送完成事件
+        res.write('event: done\ndata: {}\n\n');
         res.end();
+        
         return true;
     } catch (error) {
-        console.error('Error in sendLongResponse:', error);
+        console.error('Error in streamResponse:', error);
         return false;
-    }
-}
-
-// 错误响应发送函数
-function sendErrorResponse(res, errorMessage) {
-    try {
-        if (!res.writableEnded) {
-            sendSSE(res, 'error', { 
-                text: errorMessage,
-                allow_retry: true 
-            });
-            sendSSE(res, 'done', {});
-            res.end();
-        }
-    } catch (error) {
-        console.error('Error sending error response:', error);
     }
 }
 
@@ -70,73 +37,88 @@ app.post('/', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    
+    // 设置更长的超时时间
+    req.setTimeout(60000);
+    res.setTimeout(60000);
 
     try {
-        console.log('Received request:', JSON.stringify(req.body, null, 2));
-
         const query = req.body.query;
         const lastMessage = Array.isArray(query) && query.length > 0 
             ? query[query.length - 1] 
             : null;
 
         if (!lastMessage?.content) {
-            sendErrorResponse(res, 'No message content found');
-            return;
+            throw new Error('No message content found');
         }
 
-        // 调用 X.AI API，带重试机制
-        let retries = 2;
-        let xaiResponse;
-        
-        while (retries >= 0) {
-            try {
-                xaiResponse = await axios({
-                    method: 'post',
-                    url: 'https://api.x.ai/v1/chat/completions',
-                    headers: {
-                        'Authorization': `Bearer ${XAI_API_KEY}`,
-                        'Content-Type': 'application/json'
-                    },
-                    data: {
-                        model: "grok-beta",
-                        messages: [{
-                            role: 'user',
-                            content: lastMessage.content
-                        }],
-                        stream: false,
-                        max_tokens: 4000  // 增加到4000 tokens，约等于16000字符
-                    },
-                    timeout: 30000  // 增加超时时间到30秒
-                });
-                break;
-            } catch (error) {
-                if (retries === 0) throw error;
-                retries--;
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            }
+        // 配置API调用
+        const apiConfig = {
+            method: 'post',
+            url: 'https://api.x.ai/v1/chat/completions',
+            headers: {
+                'Authorization': `Bearer ${XAI_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            data: {
+                model: "grok-beta",
+                messages: [{
+                    role: 'user',
+                    content: lastMessage.content
+                }],
+                stream: false,
+                max_tokens: 8000,  // 显著增加token限制
+                temperature: 0.7
+            },
+            timeout: 45000  // 45秒超时
+        };
+
+        // 开始立即发送初始响应
+        res.write('event: text\ndata: {"text": "正在生成响应..."}\n\n');
+
+        // 执行API调用
+        let response;
+        try {
+            response = await axios(apiConfig);
+        } catch (error) {
+            console.error('First API call failed, retrying...');
+            // 等待1秒后重试
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            response = await axios(apiConfig);
         }
 
-        const responseText = xaiResponse?.data?.choices?.[0]?.message?.content;
-
+        const responseText = response?.data?.choices?.[0]?.message?.content;
         if (!responseText) {
-            sendErrorResponse(res, 'No response from X.AI');
-            return;
+            throw new Error('No response content from API');
         }
 
-        // 使用分块发送长响应
-        const success = await sendLongResponse(res, responseText);
+        // 清除初始消息
+        res.write('event: replace_response\ndata: {"text": ""}\n\n');
+
+        // 流式发送实际响应
+        const success = await streamResponse(res, responseText);
         if (!success) {
-            throw new Error('Failed to send complete response');
+            throw new Error('Failed to stream response');
         }
 
     } catch (error) {
         console.error('Error occurred:', error);
-        sendErrorResponse(res, `Error: ${error.message}`);
+        
+        try {
+            if (!res.writableEnded) {
+                res.write('event: error\n');
+                res.write(`data: {"text": "Error: ${error.message}", "allow_retry": true}\n\n`);
+                res.write('event: done\ndata: {}\n\n');
+                res.end();
+            }
+        } catch (finalError) {
+            console.error('Error sending error response:', finalError);
+        }
     }
 });
 
 app.get('/', (req, res) => {
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 const port = process.env.PORT || 3000;
