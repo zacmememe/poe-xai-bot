@@ -6,16 +6,23 @@ app.use(express.json());
 
 const XAI_API_KEY = process.env.XAI_API_KEY;
 
-// 简化的事件发送函数
-function sendSSE(res, event, data) {
-  console.log(`Sending ${event} event:`, data);
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+// 重试函数
+async function withRetry(operation, maxAttempts = 3) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      console.log(`Attempt ${attempt}/${maxAttempts}`);
+      return await operation();
+    } catch (error) {
+      if (attempt === maxAttempts) throw error;
+      console.log(`Attempt ${attempt} failed, retrying...`);
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+  }
 }
 
 // API调用函数
 async function callXAI(message) {
-  console.log('Calling X.AI API with message:', message);
-  
+  console.log('Calling X.AI API...');
   const response = await axios({
     method: 'post',
     url: 'https://api.x.ai/v1/chat/completions',
@@ -32,11 +39,18 @@ async function callXAI(message) {
       max_tokens: 800,
       temperature: 0.7
     },
-    timeout: 8000 // 8秒超时
+    timeout: 25000  // 增加到25秒
   });
-
-  console.log('X.AI API response received:', response.data);
   return response;
+}
+
+function sendSSE(res, event, data) {
+  try {
+    console.log(`Sending ${event} event`);
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  } catch (error) {
+    console.error(`Error sending ${event} event:`, error);
+  }
 }
 
 app.post('/', async (req, res) => {
@@ -45,16 +59,15 @@ app.post('/', async (req, res) => {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
-  let isDone = false;
+  let isResponseSent = false;
 
-  // 确保响应结束
-  const finish = (error = null) => {
-    if (isDone) return;
-    isDone = true;
+  const completeResponse = (error = null) => {
+    if (isResponseSent) return;
+    isResponseSent = true;
 
     try {
       if (error) {
-        console.error('Sending error:', error.message);
+        console.log('Sending error response:', error.message);
         sendSSE(res, 'error', {
           text: `Error: ${error.message}`,
           allow_retry: true
@@ -63,14 +76,14 @@ app.post('/', async (req, res) => {
       sendSSE(res, 'done', {});
       res.end();
     } catch (e) {
-      console.error('Error during finish:', e);
+      console.error('Error in completeResponse:', e);
     }
   };
 
   try {
-    console.log('Request received:', req.body);
-
+    console.log('Processing request...');
     const message = req.body.query?.[0]?.content;
+    
     if (!message) {
       throw new Error('No message content found');
     }
@@ -78,47 +91,31 @@ app.post('/', async (req, res) => {
     // 发送meta事件
     sendSSE(res, 'meta', { content_type: 'text/markdown' });
 
-    // 设置超时
-    const timeout = setTimeout(() => {
-      if (!isDone) {
-        finish(new Error('Request timeout'));
-      }
-    }, 15000);
-
-    try {
-      // 调用API
-      const response = await callXAI(message);
-      const responseText = response.data?.choices?.[0]?.message?.content;
-
-      if (!responseText) {
-        throw new Error('Empty response from X.AI');
-      }
-
-      // 发送响应
-      console.log('Sending response text:', responseText);
-      sendSSE(res, 'text', { text: responseText });
-      
-      // 正常完成
-      clearTimeout(timeout);
-      finish();
-
-    } catch (apiError) {
-      console.error('API Error:', apiError);
-      throw apiError;
+    // 使用重试机制调用API
+    const response = await withRetry(async () => await callXAI(message));
+    
+    const responseText = response.data?.choices?.[0]?.message?.content;
+    if (!responseText) {
+      throw new Error('Empty response from X.AI');
     }
 
+    // 发送响应文本
+    console.log('Sending response text');
+    sendSSE(res, 'text', { text: responseText });
+    
+    // 完成响应
+    completeResponse();
+
   } catch (error) {
-    console.error('Error in request handler:', error);
-    finish(error);
+    console.error('Request failed:', error);
+    completeResponse(error);
   }
 });
 
-// 基础路由
 app.get('/', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-// 启动服务器
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
