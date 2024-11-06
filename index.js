@@ -36,7 +36,7 @@ app.post('/', async (req, res) => {
         'Content-Type': 'application/json'
       },
       data: {
-        model: "default", // 改用 default 作为模型名称
+        model: "grok-beta", // 使用 grok-beta 模型
         messages: [{
           role: 'user',
           content: messageContent
