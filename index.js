@@ -21,10 +21,6 @@ function sendSSE(res, event, data) {
 }
 
 async function streamResponse(res, message) {
-    let streamEnded = false;
-    let responseBuffer = '';
-    let lastSentIndex = 0;
-
     try {
         log('Starting streaming API call');
 
@@ -33,8 +29,7 @@ async function streamResponse(res, message) {
             url: 'https://api.x.ai/v1/chat/completions',
             headers: {
                 'Authorization': `Bearer ${XAI_API_KEY}`,
-                'Content-Type': 'application/json',
-                'Accept': 'text/event-stream'
+                'Content-Type': 'application/json'
             },
             data: {
                 model: "grok-beta",
@@ -52,63 +47,71 @@ async function streamResponse(res, message) {
         sendSSE(res, 'replace_response', { text: '' });
 
         return new Promise((resolve, reject) => {
-            const cleanup = () => {
-                if (!streamEnded) {
-                    streamEnded = true;
-                    // 确保发送剩余的缓冲内容
-                    if (responseBuffer.length > lastSentIndex) {
-                        const remainingContent = responseBuffer.slice(lastSentIndex);
-                        sendSSE(res, 'text', { text: remainingContent });
-                    }
-                    sendSSE(res, 'done', {});
-                    resolve();
-                }
-            };
-
-            // 设置超时保护
-            const timeoutId = setTimeout(() => {
-                cleanup();
-                log('Stream timeout');
-            }, 8000);
-
+            let buffer = '';
+            
             response.data.on('data', chunk => {
                 try {
-                    const lines = chunk.toString().split('\n');
-                    for (const line of lines) {
+                    // 将新的数据添加到缓冲区
+                    buffer += chunk.toString();
+                    
+                    // 处理缓冲区中的完整数据行
+                    while (true) {
+                        const newlineIndex = buffer.indexOf('\n');
+                        if (newlineIndex === -1) break;
+                        
+                        const line = buffer.slice(0, newlineIndex);
+                        buffer = buffer.slice(newlineIndex + 1);
+                        
                         if (line.startsWith('data: ')) {
+                            const data = line.slice(6);
+                            if (data === '[DONE]') continue;
+                            
                             try {
-                                const data = JSON.parse(line.slice(6));
-                                if (data.choices?.[0]?.delta?.content) {
-                                    const content = data.choices[0].delta.content;
-                                    responseBuffer += content;
-                                    
-                                    // 累积一定量的内容后再发送
-                                    if (responseBuffer.length - lastSentIndex >= 100) {
-                                        const toSend = responseBuffer.slice(lastSentIndex);
-                                        if (sendSSE(res, 'text', { text: toSend })) {
-                                            lastSentIndex = responseBuffer.length;
-                                        }
-                                    }
+                                const parsed = JSON.parse(data);
+                                if (parsed.choices?.[0]?.delta?.content) {
+                                    // 立即发送每个字符
+                                    sendSSE(res, 'text', { 
+                                        text: parsed.choices[0].delta.content 
+                                    });
                                 }
                             } catch (e) {
-                                log('Error parsing chunk data:', e.message);
+                                log('JSON parse error:', e.message);
+                                log('Problematic data:', data);
                             }
                         }
                     }
                 } catch (error) {
-                    log('Error processing chunk:', error.message);
+                    log('Chunk processing error:', error.message);
                 }
             });
 
             response.data.on('end', () => {
-                clearTimeout(timeoutId);
-                cleanup();
+                // 处理缓冲区中剩余的数据
+                if (buffer.length > 0) {
+                    const lines = buffer.split('\n');
+                    for (const line of lines) {
+                        if (line.startsWith('data: ') && line.length > 6) {
+                            try {
+                                const data = JSON.parse(line.slice(6));
+                                if (data.choices?.[0]?.delta?.content) {
+                                    sendSSE(res, 'text', { 
+                                        text: data.choices[0].delta.content 
+                                    });
+                                }
+                            } catch (e) {
+                                log('Final JSON parse error:', e.message);
+                            }
+                        }
+                    }
+                }
+
+                // 完成流式传输
+                sendSSE(res, 'done', {});
+                resolve();
                 log('Stream completed successfully');
             });
 
             response.data.on('error', error => {
-                clearTimeout(timeoutId);
-                cleanup();
                 log('Stream error:', error.message);
                 reject(error);
             });
@@ -137,9 +140,16 @@ app.post('/', async (req, res) => {
         }
 
         // 发送初始事件
-        sendSSE(res, 'meta', { content_type: 'text/markdown' });
-        sendSSE(res, 'text', { text: '正在生成回应...\n' });
-
+        sendSSE(res, 'meta', {
+            content_type: 'text/markdown',
+            suggested_replies: true,
+            allow_attachments: true,
+            markdown_rendering_policy: {
+                allow_font_families: true,
+                allow_images: true
+            }
+        });
+        
         // 开始流式响应
         await streamResponse(res, message);
 
