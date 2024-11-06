@@ -26,11 +26,16 @@ app.post('/', async (req, res) => {
         'Content-Type': 'application/json'
       },
       data: {
-        model: "x.ai", // 使用 x.ai 的模型
+        model: "x.ai-gpt4",
         messages: [{
           role: 'user',
-          content: req.body.query
-        }]
+          // 修改消息格式
+          content: {
+            type: 'text',
+            text: req.body.query
+          }
+        }],
+        stream: false
       }
     });
 
@@ -41,14 +46,15 @@ app.post('/', async (req, res) => {
     }
 
     return res.json({
-      text: xaiResponse.data.choices[0].message.content
+      text: xaiResponse.data.choices[0].message.content.text
     });
 
   } catch (error) {
     console.error('Error details:', {
       message: error.message,
       data: error.response?.data,
-      status: error.response?.status
+      status: error.response?.status,
+      request: error.config?.data // 添加请求数据到日志
     });
 
     return res.json({
