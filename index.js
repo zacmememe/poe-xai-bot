@@ -1,5 +1,4 @@
 const express = require('express');
-const axios = require('axios');
 const app = express();
 
 app.use(express.json());
@@ -21,55 +20,20 @@ function sendSSE(res, event, data) {
     }
 }
 
-// 模拟API响应以测试流程
-function getFallbackResponse(error) {
-    return `抱歉，API暂时无法访问。错误信息：${error.message}\n\n这是一个测试响应，用于验证消息传递系统是否正常工作。`;
-}
-
 async function makeAPICall(content) {
+    log('Starting API call with fetch');
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
     try {
-        log('Starting API call');
-        
-        // 添加请求拦截器记录请求信息
-        axios.interceptors.request.use(config => {
-            log('API Request:', {
-                url: config.url,
-                method: config.method,
-                headers: {
-                    ...config.headers,
-                    'Authorization': 'Bearer [HIDDEN]'
-                }
-            });
-            return config;
-        });
-
-        // 添加响应拦截器记录响应信息
-        axios.interceptors.response.use(
-            response => {
-                log('API Response received:', {
-                    status: response.status,
-                    headers: response.headers
-                });
-                return response;
-            },
-            error => {
-                log('API Response error:', {
-                    message: error.message,
-                    status: error.response?.status,
-                    data: error.response?.data
-                });
-                throw error;
-            }
-        );
-
-        const response = await axios({
-            method: 'post',
-            url: 'https://api.x.ai/v1/chat/completions',
+        const response = await fetch('https://api.x.ai/v1/chat/completions', {
+            method: 'POST',
             headers: {
                 'Authorization': `Bearer ${XAI_API_KEY}`,
                 'Content-Type': 'application/json'
             },
-            data: {
+            body: JSON.stringify({
                 model: "grok-beta",
                 messages: [{
                     role: 'user',
@@ -77,27 +41,30 @@ async function makeAPICall(content) {
                 }],
                 temperature: 0.7,
                 max_tokens: 2000
-            },
-            timeout: 15000,
-            validateStatus: status => status === 200
+            }),
+            signal: controller.signal
         });
 
-        const responseText = response.data?.choices?.[0]?.message?.content;
-        if (!responseText) {
-            throw new Error('API返回数据格式无效');
+        clearTimeout(timeout);
+
+        log('API Response status:', response.status);
+
+        if (!response.ok) {
+            throw new Error(`API error: ${response.status}`);
         }
 
-        return responseText;
-
-    } catch (error) {
-        log('API Error details:', {
-            message: error.message,
-            code: error.code,
-            response: error.response?.data
+        const data = await response.json();
+        log('API Response received:', { 
+            hasChoices: !!data.choices,
+            choicesLength: data.choices?.length
         });
 
-        // 返回一个应急响应
-        return getFallbackResponse(error);
+        return data.choices?.[0]?.message?.content || '抱歉，API返回了空响应。';
+
+    } catch (error) {
+        clearTimeout(timeout);
+        log('API Call Error:', error.message);
+        throw error;
     }
 }
 
@@ -111,7 +78,7 @@ app.post('/', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    let responseSent = false;
+    let responseStarted = false;
 
     try {
         const message = req.body.query?.[req.body.query.length - 1]?.content;
@@ -119,45 +86,54 @@ app.post('/', async (req, res) => {
             throw new Error('未找到消息内容');
         }
 
-        log('Starting request processing');
+        log('Processing request:', { content: message });
 
         // 发送初始消息
         sendSSE(res, 'meta', { content_type: 'text/markdown' });
         sendSSE(res, 'replace_response', { text: '正在处理请求...\n\n' });
-        
+        responseStarted = true;
+
         // 发送连接测试消息
         sendSSE(res, 'text', { text: '连接测试成功，正在调用API...\n\n' });
-        
+
+        // 设置超时保护
+        const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('请求超时')), 20000);
+        });
+
         // API调用
-        log('Calling API');
-        const responseText = await makeAPICall(message);
-        log('API call completed', { responseLength: responseText.length });
+        const responseText = await Promise.race([
+            makeAPICall(message),
+            timeoutPromise
+        ]);
+
+        log('Response received:', { length: responseText.length });
 
         // 清除等待消息
         sendSSE(res, 'replace_response', { text: '' });
 
         // 分块发送响应
         const chunkSize = 500;
-        let position = 0;
-        while (position < responseText.length) {
-            const chunk = responseText.slice(position, position + chunkSize);
+        for (let i = 0; i < responseText.length; i += chunkSize) {
+            const chunk = responseText.slice(i, i + chunkSize);
             if (!sendSSE(res, 'text', { text: chunk })) {
                 throw new Error('发送响应块失败');
             }
-            position += chunkSize;
             await new Promise(resolve => setTimeout(resolve, 10));
         }
 
-        responseSent = true;
         sendSSE(res, 'done', {});
         res.end();
         log('Response completed successfully');
 
     } catch (error) {
-        log('Error in request handler:', error.message);
+        log('Request handler error:', error.message);
 
-        if (!responseSent && !res.writableEnded) {
+        if (!res.writableEnded) {
             try {
+                if (!responseStarted) {
+                    sendSSE(res, 'meta', { content_type: 'text/markdown' });
+                }
                 sendSSE(res, 'error', {
                     text: `处理请求时出错: ${error.message}`,
                     allow_retry: true
@@ -176,7 +152,6 @@ app.listen(port, () => {
     log('Server started', { port, hasAPIKey: !!XAI_API_KEY });
 });
 
-// 全局错误处理
 process.on('uncaughtException', error => {
     log('Uncaught Exception:', error.message);
 });
