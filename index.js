@@ -7,67 +7,50 @@ app.use(express.json());
 const XAI_API_KEY = process.env.XAI_API_KEY;
 
 function log(msg, data = null) {
-    const logMsg = data ? `${msg} ${JSON.stringify(data)}` : msg;
-    console.log(`[${new Date().toISOString()}] ${logMsg}`);
+    console.log(`[${new Date().toISOString()}] ${msg}`, data ? JSON.stringify(data) : '');
 }
 
 function sendSSE(res, event, data) {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    try {
+        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch (error) {
+        log('SSE Error:', error.message);
+    }
 }
 
-async function makeAPICall(content, retries = 3) {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-            log(`API attempt ${attempt}/${retries}`);
-            
-            const response = await axios({
-                method: 'post',
-                url: 'https://api.x.ai/v1/chat/completions',
-                headers: {
-                    'Authorization': `Bearer ${XAI_API_KEY}`,
-                    'Content-Type': 'application/json',
-                    'Accept': 'application/json'
-                },
-                data: {
-                    model: "grok-beta",
-                    messages: [{
-                        role: 'user',
-                        content: content
-                    }],
-                    temperature: 0.7,
-                    max_tokens: 2000
-                },
-                validateStatus: null, // 允许任何状态码
-                timeout: 10000
-            });
+async function makeAPICall(content) {
+    try {
+        const response = await axios({
+            method: 'post',
+            url: 'https://api.x.ai/v1/chat/completions',
+            headers: {
+                'Authorization': `Bearer ${XAI_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            data: {
+                model: "grok-beta",
+                messages: [{
+                    role: 'user',
+                    content: content
+                }],
+                temperature: 0.7,
+                max_tokens: 2000
+            },
+            timeout: 30000
+        });
 
-            log('API Response Status:', response.status);
+        log('API Response:', {
+            status: response.status,
+            hasData: !!response.data
+        });
 
-            if (response.status !== 200) {
-                throw new Error(`API returned status ${response.status}: ${JSON.stringify(response.data)}`);
-            }
-
-            const responseText = response.data?.choices?.[0]?.message?.content;
-            if (!responseText) {
-                throw new Error('API response missing content');
-            }
-
-            return responseText;
-
-        } catch (error) {
-            log('API Error:', {
-                attempt,
-                error: error.message,
-                response: error.response?.data
-            });
-
-            if (attempt === retries) {
-                throw error;
-            }
-
-            // 等待后重试
-            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-        }
+        return response.data?.choices?.[0]?.message?.content || null;
+    } catch (error) {
+        log('API Error:', {
+            message: error.message,
+            response: error.response?.data
+        });
+        throw error;
     }
 }
 
@@ -76,66 +59,66 @@ app.post('/', async (req, res) => {
         return res.json({ status: 'ok' });
     }
 
-    log('Query received:', { type: req.body.type });
-
+    // 设置响应头
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    let responseStarted = false;
-
     try {
         const message = req.body.query?.[req.body.query.length - 1]?.content;
         if (!message) {
-            throw new Error('No message content');
+            throw new Error('没有找到消息内容');
         }
 
-        // 初始响应
+        log('Processing query:', { content: message });
+
+        // 发送初始消息
         sendSSE(res, 'meta', { content_type: 'text/markdown' });
-        sendSSE(res, 'replace_response', { text: '正在处理请求...\n\n' });
-        responseStarted = true;
+        sendSSE(res, 'text', { text: '正在处理请求...' });
 
-        // 调用API
+        // 先发送一个测试消息确认连接正常
+        sendSSE(res, 'text', { text: '\n\n连接测试: 正在调用API...\n' });
+
+        // API调用
         const responseText = await makeAPICall(message);
-        log('API call successful, response length:', responseText.length);
+        
+        if (!responseText) {
+            throw new Error('API返回为空');
+        }
 
-        // 清除等待消息
+        // 清除之前的消息
         sendSSE(res, 'replace_response', { text: '' });
 
-        // 发送测试消息
-        const testResponse = '测试响应：我收到了你的请求，正在处理中。API调用已完成，这是一个测试消息。';
-        sendSSE(res, 'text', { text: testResponse });
+        // 发送实际响应
+        log('Sending response');
+        sendSSE(res, 'text', { text: responseText });
 
+        // 完成响应
         sendSSE(res, 'done', {});
         res.end();
         log('Response completed');
 
     } catch (error) {
-        log('Error occurred:', {
-            message: error.message,
-            responseStarted
-        });
-
-        if (!res.writableEnded) {
-            if (!responseStarted) {
-                sendSSE(res, 'meta', { content_type: 'text/markdown' });
-            }
+        log('Error:', error.message);
+        
+        try {
             sendSSE(res, 'error', {
-                text: `处理请求时出错: ${error.message}`,
+                text: `发生错误: ${error.message}`,
                 allow_retry: true
             });
             sendSSE(res, 'done', {});
             res.end();
+        } catch (finalError) {
+            log('Final error:', finalError.message);
         }
     }
 });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-    log('Server started on port:', port);
+    log('Server started', { port });
 });
 
-// 错误处理
 process.on('uncaughtException', error => {
     log('Uncaught Exception:', error.message);
 });
