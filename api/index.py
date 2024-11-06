@@ -1,26 +1,17 @@
 from fastapi import FastAPI, Request
-import xai
+from typing import Dict
 import os
 
 app = FastAPI()
-xai_client = xai.Client(os.getenv('XAI_API_KEY'))
 
 @app.get("/")
 async def root():
     return {"status": "ok"}
 
 @app.post("/")
-async def handle_message(request: Request):
+async def handle_message(request: Request) -> Dict:
     try:
         data = await request.json()
-        message = data.get("message", "")
-        
-        response = xai_client.completions.create(
-            model="xai-chat-beta",
-            prompt=message,
-            max_tokens=1000
-        )
-        
-        return {"response": response.choices[0].text}
+        return {"response": "test message"}  # 先测试基本功能
     except Exception as e:
         return {"response": f"Error: {str(e)}"}
