@@ -12,14 +12,9 @@ app.get('/', (req, res) => {
 
 app.post('/', async (req, res) => {
   try {
-    const message = req.body.message || '';
-    console.log('Received message:', message); // 添加日志
-    console.log('API Key:', XAI_API_KEY ? 'Present' : 'Missing'); // 检查 API key
-
-    if (!XAI_API_KEY) {
-      throw new Error('API key is not configured');
-    }
-
+    // Poe sends the message in this format
+    const query = req.body.query || '';
+    
     const response = await axios({
       method: 'post',
       url: 'https://api.x.ai/v1/chat/completions',
@@ -28,22 +23,22 @@ app.post('/', async (req, res) => {
         'Content-Type': 'application/json'
       },
       data: {
-        model: 'xai-chat-beta',
         messages: [{
           role: 'user',
-          content: message
-        }],
-        max_tokens: 1000
+          content: query
+        }]
       }
     });
 
-    console.log('X.AI Response:', response.data); // 添加日志
-    res.json({ response: response.data.choices[0].message.content });
+    // Poe expects response in this format
+    res.json({ 
+      text: response.data.choices[0].message.content
+    });
+    
   } catch (error) {
-    console.error('Detailed Error:', error); // 添加更详细的错误日志
-    res.status(500).json({ 
-      response: `Error: ${error.message}`,
-      details: error.response?.data || 'No additional details'
+    console.error('Error:', error.response?.data || error.message);
+    res.json({ 
+      text: `Error: ${error.message}`
     });
   }
 });
