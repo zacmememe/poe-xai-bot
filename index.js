@@ -12,29 +12,32 @@ app.get('/', (req, res) => {
 
 app.post('/', async (req, res) => {
   try {
-    console.log('Received request:', JSON.stringify(req.body));
+    // 详细记录收到的请求
+    console.log('Received Poe request:', JSON.stringify(req.body, null, 2));
 
-    const query = req.body.query;
+    // 从 Poe 请求中提取消息
     let messageContent = '';
-    
-    if (Array.isArray(query)) {
-      const lastMessage = query[query.length - 1];
-      messageContent = lastMessage.content || '';
-    } else {
-      messageContent = query || '';
+    if (req.body.query && Array.isArray(req.body.query)) {
+      const lastMessage = req.body.query[req.body.query.length - 1];
+      if (lastMessage && lastMessage.content) {
+        messageContent = lastMessage.content;
+      }
     }
 
     if (!messageContent) {
-      return res.json({ text: 'No query provided' });
+      console.log('No message content found in request');
+      return res.status(200).json({ text: '' });
     }
 
+    console.log('Extracted message:', messageContent);
+
+    // 发送到 X.AI
     const xaiResponse = await axios({
       method: 'post',
       url: 'https://api.x.ai/v1/chat/completions',
       headers: {
         'Authorization': `Bearer ${XAI_API_KEY}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
+        'Content-Type': 'application/json'
       },
       data: {
         model: "grok-beta",
@@ -43,42 +46,42 @@ app.post('/', async (req, res) => {
           content: messageContent
         }],
         stream: false
-      },
-      responseType: 'json'
+      }
     });
 
-    console.log('X.AI Response:', JSON.stringify(xaiResponse.data));
+    console.log('X.AI raw response:', JSON.stringify(xaiResponse.data, null, 2));
 
-    // 确保我们能获取到响应内容
-    const responseContent = xaiResponse.data?.choices?.[0]?.message?.content;
-    
-    if (!responseContent) {
-      console.error('No response content found in:', xaiResponse.data);
-      return res.json({ text: 'No response content from X.AI' });
+    // 从 X.AI 响应中提取回复内容
+    const responseText = xaiResponse.data?.choices?.[0]?.message?.content;
+
+    if (!responseText) {
+      console.log('No response text found in X.AI response');
+      return res.status(200).json({ text: '' });
     }
 
-    // 直接返回响应内容，确保是字符串格式
-    return res.json({
-      text: String(responseContent)
+    console.log('Sending response to Poe:', { text: responseText });
+
+    // 返回给 Poe
+    return res.status(200).json({
+      text: responseText
     });
 
   } catch (error) {
-    console.error('Error details:', {
+    console.error('Error occurred:', {
       message: error.message,
-      data: error.response?.data,
-      status: error.response?.status,
-      request: error.config?.data
+      response: error.response?.data,
+      status: error.response?.status
     });
 
-    // 确保错误消息也是字符串格式
-    return res.json({
-      text: String(`Error: ${error.message}. ${error.response?.data?.error || ''}`)
+    // 即使发生错误也返回 200 状态码
+    return res.status(200).json({
+      text: `Error: ${error.message}`
     });
   }
 });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log(`Server started on port ${port}`);
-  console.log(`API Key present: ${!!XAI_API_KEY}`);
+  console.log(`Server running on port ${port}`);
+  console.log(`API Key configured: ${!!XAI_API_KEY}`);
 });
