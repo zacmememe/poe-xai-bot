@@ -6,20 +6,17 @@ app.use(express.json());
 
 const XAI_API_KEY = process.env.XAI_API_KEY;
 
-// 分块发送响应
-async function streamResponse(res, text, chunkSize = 50) {
-    // 1. 发送meta事件
+// 流式发送响应
+function startStream(res) {
+    // 发送meta事件
     res.write('event: meta\ndata: {"content_type": "text/markdown"}\n\n');
-    
-    // 2. 分块发送文本
-    for (let i = 0; i < text.length; i += chunkSize) {
-        const chunk = text.slice(i, i + chunkSize);
-        res.write(`event: text\ndata: {"text": ${JSON.stringify(chunk)}}\n\n`);
-        // 减少延迟时间
-        await new Promise(resolve => setTimeout(resolve, 5));
-    }
-    
-    // 3. 发送完成事件
+}
+
+function sendChunk(res, text) {
+    res.write(`event: text\ndata: {"text": ${JSON.stringify(text)}}\n\n`);
+}
+
+function endStream(res) {
     res.write('event: done\ndata: {}\n\n');
     res.end();
 }
@@ -43,7 +40,7 @@ async function callXAI(message) {
             max_tokens: 1000,
             temperature: 0.7
         },
-        timeout: 10000 // 10秒超时
+        timeout: 8000
     });
 }
 
@@ -53,49 +50,59 @@ app.post('/', async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    // 设置响应超时
-    res.setTimeout(15000);
-
     try {
         console.log('Request received:', new Date().toISOString());
-        console.log('Request body:', JSON.stringify(req.body, null, 2));
-
-        // 获取消息内容
         const message = req.body.query?.[0]?.content;
+        
         if (!message) {
             throw new Error('No message content found');
         }
 
-        // 添加超时控制
-        const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error('Request timeout')), 12000)
-        );
+        // 立即开始流式响应
+        startStream(res);
 
-        // 带重试的API调用
-        const apiCallWithRetry = async () => {
-            for (let i = 0; i < 2; i++) {
-                try {
-                    const response = await callXAI(message);
-                    return response.data?.choices?.[0]?.message?.content;
-                } catch (error) {
-                    if (i === 1) throw error;
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
+        // 发送等待消息
+        sendChunk(res, "正在思考中...");
+
+        // 调用API并处理响应
+        let responseText;
+        try {
+            const response = await callXAI(message);
+            responseText = response.data?.choices?.[0]?.message?.content;
+        } catch (apiError) {
+            console.error('API call failed, retrying once...', apiError);
+            // 发送等待重试消息
+            sendChunk(res, "\n重试中...");
+            
+            // 等待短暂时间后重试
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            try {
+                const response = await callXAI(message);
+                responseText = response.data?.choices?.[0]?.message?.content;
+            } catch (retryError) {
+                throw new Error('API call failed after retry');
             }
-        };
-
-        // 竞争Promise
-        const responseText = await Promise.race([
-            apiCallWithRetry(),
-            timeoutPromise
-        ]);
+        }
 
         if (!responseText) {
             throw new Error('Empty response from API');
         }
 
-        console.log('Response length:', responseText.length);
-        await streamResponse(res, responseText);
+        // 清除等待消息
+        sendChunk(res, "\n\n");
+
+        // 分块发送实际响应
+        const chunkSize = 50;
+        for (let i = 0; i < responseText.length; i += chunkSize) {
+            const chunk = responseText.slice(i, i + chunkSize);
+            sendChunk(res, chunk);
+            // 非常小的延迟以确保顺序
+            await new Promise(resolve => setTimeout(resolve, 2));
+        }
+
+        // 完成响应
+        endStream(res);
 
     } catch (error) {
         console.error('Error occurred:', error);
