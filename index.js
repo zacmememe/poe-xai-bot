@@ -6,129 +6,126 @@ app.use(express.json());
 
 const XAI_API_KEY = process.env.XAI_API_KEY;
 
-// 发送单个 SSE 事件的函数
-function sendEvent(res, event, data) {
-  try {
-    const eventString = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-    res.write(eventString);
-    return true;
-  } catch (error) {
-    console.error(`Error sending ${event} event:`, error);
-    return false;
-  }
+// 简化的事件发送函数
+function sendSSE(res, event, data) {
+  console.log(`Sending ${event} event:`, data);
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-// 完整的响应序列
-async function sendCompleteResponse(res, content) {
-  try {
-    // 1. 发送 meta 事件
-    if (!sendEvent(res, 'meta', { content_type: 'text/markdown' })) {
-      throw new Error('Failed to send meta event');
-    }
+// API调用函数
+async function callXAI(message) {
+  console.log('Calling X.AI API with message:', message);
+  
+  const response = await axios({
+    method: 'post',
+    url: 'https://api.x.ai/v1/chat/completions',
+    headers: {
+      'Authorization': `Bearer ${XAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    data: {
+      model: "grok-beta",
+      messages: [{
+        role: 'user',
+        content: message
+      }],
+      max_tokens: 800,
+      temperature: 0.7
+    },
+    timeout: 8000 // 8秒超时
+  });
 
-    // 等待一小段时间
-    await new Promise(resolve => setTimeout(resolve, 100));
-
-    // 2. 发送文本内容
-    if (!sendEvent(res, 'text', { text: content })) {
-      throw new Error('Failed to send text event');
-    }
-
-    // 再等待一小段时间
-    await new Promise(resolve => setTimeout(resolve, 100));
-
-    // 3. 发送结束事件
-    if (!sendEvent(res, 'done', {})) {
-      throw new Error('Failed to send done event');
-    }
-
-    // 4. 结束响应
-    res.end();
-    return true;
-  } catch (error) {
-    console.error('Error in sendCompleteResponse:', error);
-    return false;
-  }
+  console.log('X.AI API response received:', response.data);
+  return response;
 }
 
 app.post('/', async (req, res) => {
-  console.log('Received request:', JSON.stringify(req.body, null, 2));
-
   // 设置响应头
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
+  let isDone = false;
+
+  // 确保响应结束
+  const finish = (error = null) => {
+    if (isDone) return;
+    isDone = true;
+
+    try {
+      if (error) {
+        console.error('Sending error:', error.message);
+        sendSSE(res, 'error', {
+          text: `Error: ${error.message}`,
+          allow_retry: true
+        });
+      }
+      sendSSE(res, 'done', {});
+      res.end();
+    } catch (e) {
+      console.error('Error during finish:', e);
+    }
+  };
+
   try {
+    console.log('Request received:', req.body);
+
     const message = req.body.query?.[0]?.content;
     if (!message) {
       throw new Error('No message content found');
     }
 
-    // 调用 X.AI API
-    const response = await axios({
-      method: 'post',
-      url: 'https://api.x.ai/v1/chat/completions',
-      headers: {
-        'Authorization': `Bearer ${XAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      data: {
-        model: "grok-beta",
-        messages: [{
-          role: 'user',
-          content: message
-        }],
-        max_tokens: 800,
-        temperature: 0.7
-      },
-      timeout: 10000 // 10 秒超时
-    });
+    // 发送meta事件
+    sendSSE(res, 'meta', { content_type: 'text/markdown' });
 
-    const responseText = response.data?.choices?.[0]?.message?.content;
-    if (!responseText) {
-      throw new Error('Empty response from X.AI');
-    }
+    // 设置超时
+    const timeout = setTimeout(() => {
+      if (!isDone) {
+        finish(new Error('Request timeout'));
+      }
+    }, 15000);
 
-    // 记录响应内容
-    console.log('X.AI response:', responseText);
+    try {
+      // 调用API
+      const response = await callXAI(message);
+      const responseText = response.data?.choices?.[0]?.message?.content;
 
-    // 发送完整响应
-    const success = await sendCompleteResponse(res, responseText);
-    if (!success) {
-      throw new Error('Failed to send complete response');
+      if (!responseText) {
+        throw new Error('Empty response from X.AI');
+      }
+
+      // 发送响应
+      console.log('Sending response text:', responseText);
+      sendSSE(res, 'text', { text: responseText });
+      
+      // 正常完成
+      clearTimeout(timeout);
+      finish();
+
+    } catch (apiError) {
+      console.error('API Error:', apiError);
+      throw apiError;
     }
 
   } catch (error) {
-    console.error('Error occurred:', error);
-    
-    // 发送错误响应
-    try {
-      if (!res.writableEnded) {
-        sendEvent(res, 'error', {
-          text: `Error: ${error.message}`,
-          allow_retry: true
-        });
-        sendEvent(res, 'done', {});
-        res.end();
-      }
-    } catch (finalError) {
-      console.error('Error sending error response:', finalError);
-    }
+    console.error('Error in request handler:', error);
+    finish(error);
   }
 });
 
+// 基础路由
 app.get('/', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+// 启动服务器
 const port = process.env.PORT || 3000;
-const server = app.listen(port, () => {
+app.listen(port, () => {
   console.log(`Server running on port ${port}`);
   console.log(`API Key configured: ${!!XAI_API_KEY}`);
 });
 
-// 错误处理
+// 全局错误处理
 process.on('uncaughtException', (error) => {
   console.error('Uncaught exception:', error);
 });
