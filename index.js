@@ -8,12 +8,54 @@ const XAI_API_KEY = process.env.XAI_API_KEY;
 
 // 调试函数
 function debugLog(label, data) {
-    console.log(`${label}:`, JSON.stringify(data, null, 2));
+    console.log(`=== ${label} ===`);
+    console.log(JSON.stringify(data, null, 2));
+    console.log('='.repeat(50));
+}
+
+// 验证请求内容
+function validateRequest(body) {
+    // 验证基本结构
+    if (!body) {
+        throw new Error('Empty request body');
+    }
+    debugLog('Request body', body);
+
+    // 验证query字段
+    if (!body.query) {
+        throw new Error('Missing query field');
+    }
+    debugLog('Query field', body.query);
+
+    // 验证是否为数组
+    if (!Array.isArray(body.query)) {
+        throw new Error(`Query is not an array: ${typeof body.query}`);
+    }
+
+    // 验证数组内容
+    if (body.query.length === 0) {
+        throw new Error('Query array is empty');
+    }
+
+    // 获取最后一条消息
+    const lastMessage = body.query[body.query.length - 1];
+    debugLog('Last message', lastMessage);
+
+    if (!lastMessage || typeof lastMessage !== 'object') {
+        throw new Error('Invalid last message format');
+    }
+
+    if (!lastMessage.content) {
+        throw new Error('Missing content in last message');
+    }
+
+    return lastMessage.content.trim();
 }
 
 // API调用函数
 async function callXAI(message) {
-    console.log('Calling X.AI API with message:', message);
+    debugLog('Calling API with message', message);
+    
     return axios({
         method: 'post',
         url: 'https://api.x.ai/v1/chat/completions',
@@ -36,11 +78,12 @@ async function callXAI(message) {
 
 // SSE事件发送函数
 function sendSSE(res, event, data) {
-    console.log(`Sending ${event} event with data:`, data);
+    debugLog(`Sending ${event} event`, data);
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
 app.post('/', async (req, res) => {
+    // 设置响应头
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -53,7 +96,7 @@ app.post('/', async (req, res) => {
 
         try {
             if (error) {
-                console.log('Sending error:', error.message);
+                debugLog('Error in request', error);
                 sendSSE(res, 'error', {
                     text: error.message,
                     allow_retry: true
@@ -67,37 +110,15 @@ app.post('/', async (req, res) => {
     };
 
     try {
-        debugLog('Received request body', req.body);
+        debugLog('Starting request processing', new Date().toISOString());
 
-        // 请求内容验证
-        if (!req.body) {
-            throw new Error('Empty request body');
-        }
-
-        const query = req.body.query;
-        debugLog('Query content', query);
-
-        if (!Array.isArray(query) || query.length === 0) {
-            throw new Error('Invalid query format');
-        }
-
-        const lastMessage = query[query.length - 1];
-        debugLog('Last message', lastMessage);
-
-        if (!lastMessage || typeof lastMessage.content !== 'string') {
-            throw new Error('Invalid message content');
-        }
-
-        const messageContent = lastMessage.content.trim();
-        if (!messageContent) {
-            throw new Error('Empty message content');
-        }
-
+        // 验证并获取消息内容
+        const messageContent = validateRequest(req.body);
+        
         // 发送meta事件
         sendSSE(res, 'meta', { content_type: 'text/markdown' });
 
         // 调用API
-        console.log('Calling API with content:', messageContent);
         const response = await callXAI(messageContent);
         
         const responseText = response.data?.choices?.[0]?.message?.content;
@@ -110,7 +131,7 @@ app.post('/', async (req, res) => {
         complete();
 
     } catch (error) {
-        console.error('Error occurred:', error);
+        debugLog('Error occurred', error);
         complete(error);
     }
 });
